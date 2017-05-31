@@ -226,8 +226,12 @@ void HelloTypeAofRewrite(RedisModuleIO *aof, RedisModuleString *key, void *value
     }
 }
 
-void HelloTypeDigest(RedisModuleDigest *digest, void *value) {
-    /* TODO: The DIGEST module interface is yet not implemented. */
+/* The goal of this function is to return the amount of memory used by
+ * the HelloType value. */
+size_t HelloTypeMemUsage(const void *value) {
+    const struct HelloTypeObject *hto = value;
+    struct HelloTypeNode *node = hto->head;
+    return sizeof(*hto) + sizeof(*node)*hto->len;
 }
 
 void HelloTypeFree(void *value) {
@@ -237,10 +241,22 @@ void HelloTypeFree(void *value) {
 /* This function must be present on each Redis module. It is used in order to
  * register the commands into the Redis server. */
 int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
+    REDISMODULE_NOT_USED(argc);
+
     if (RedisModule_Init(ctx,"hellotype",1,REDISMODULE_APIVER_1)
         == REDISMODULE_ERR) return REDISMODULE_ERR;
 
-    HelloType = RedisModule_CreateDataType(ctx,"hellotype",0,HelloTypeRdbLoad,HelloTypeRdbSave,HelloTypeAofRewrite,HelloTypeDigest,HelloTypeFree);
+    RedisModuleTypeMethods tm = {
+        .version = REDISMODULE_TYPE_METHOD_VERSION,
+        .rdb_load = HelloTypeRdbLoad,
+        .rdb_save = HelloTypeRdbSave,
+        .aof_rewrite = HelloTypeAofRewrite,
+        .mem_usage = HelloTypeMemUsage,
+        .free = HelloTypeFree
+    };
+
+    HelloType = RedisModule_CreateDataType(ctx,"hellotype",0,&tm);
     if (HelloType == NULL) return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx,"hellotype.insert",

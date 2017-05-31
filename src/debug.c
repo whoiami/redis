@@ -33,12 +33,14 @@
 
 #include <arpa/inet.h>
 #include <signal.h>
+#include <dlfcn.h>
 
 #ifdef HAVE_BACKTRACE
 #include <execinfo.h>
 #include <ucontext.h>
 #include <fcntl.h>
 #include "bio.h"
+#include <unistd.h>
 #endif /* HAVE_BACKTRACE */
 
 #ifdef __CYGWIN__
@@ -124,7 +126,7 @@ void computeDatasetDigest(unsigned char *final) {
         redisDb *db = server.db+j;
 
         if (dictSize(db->dict) == 0) continue;
-        di = dictGetIterator(db->dict);
+        di = dictGetSafeIterator(db->dict);
 
         /* hash the DB id, so the same dataset moved in a different
          * DB will lead to a different digest */
@@ -250,14 +252,6 @@ void computeDatasetDigest(unsigned char *final) {
     }
 }
 
-#if defined(USE_JEMALLOC)
-void inputCatSds(void *result, const char *str) {
-    /* result is actually a (sds *), so re-cast it here */
-    sds *info = (sds *)result;
-    *info = sdscat(*info, str);
-}
-#endif
-
 void debugCommand(client *c) {
     if (c->argc == 1) {
         addReplyError(c,"You must specify a subcommand for DEBUG. Try DEBUG HELP for info.");
@@ -271,6 +265,8 @@ void debugCommand(client *c) {
         "DEBUG <subcommand> arg arg ... arg. Subcommands:");
         blen++; addReplyStatus(c,
         "segfault -- Crash the server with sigsegv.");
+        blen++; addReplyStatus(c,
+        "panic -- Crash the server simulating a panic.");
         blen++; addReplyStatus(c,
         "restart  -- Graceful restart: save config, db, restart.");
         blen++; addReplyStatus(c,
@@ -286,7 +282,9 @@ void debugCommand(client *c) {
         blen++; addReplyStatus(c,
         "sdslen <key> -- Show low level SDS string info representing key and value.");
         blen++; addReplyStatus(c,
-        "populate <count> [prefix] -- Create <count> string keys named key:<num>. If a prefix is specified is used instead of the 'key' prefix.");
+        "ziplist <key> -- Show low level info about the ziplist encoding.");
+        blen++; addReplyStatus(c,
+        "populate <count> [prefix] [size] -- Create <count> string keys named key:<num>. If a prefix is specified is used instead of the 'key' prefix.");
         blen++; addReplyStatus(c,
         "digest   -- Outputs an hex signature representing the current DB content.");
         blen++; addReplyStatus(c,
@@ -301,13 +299,11 @@ void debugCommand(client *c) {
         "structsize -- Return the size of different Redis core C structures.");
         blen++; addReplyStatus(c,
         "htstats <dbid> -- Return hash table statistics of the specified Redis database.");
-        blen++; addReplyStatus(c,
-        "jemalloc info  -- Show internal jemalloc statistics.");
-        blen++; addReplyStatus(c,
-        "jemalloc purge -- Force jemalloc to release unused memory.");
         setDeferredMultiBulkLength(c,blenp,blen);
     } else if (!strcasecmp(c->argv[1]->ptr,"segfault")) {
         *((char*)-1) = 'x';
+    } else if (!strcasecmp(c->argv[1]->ptr,"panic")) {
+        serverPanic("DEBUG PANIC called at Unix time %ld", time(NULL));
     } else if (!strcasecmp(c->argv[1]->ptr,"restart") ||
                !strcasecmp(c->argv[1]->ptr,"crash-and-recover"))
     {
@@ -330,12 +326,12 @@ void debugCommand(client *c) {
         if (c->argc >= 3) c->argv[2] = tryObjectEncoding(c->argv[2]);
         serverAssertWithInfo(c,c->argv[0],1 == 2);
     } else if (!strcasecmp(c->argv[1]->ptr,"reload")) {
-        if (rdbSave(server.rdb_filename) != C_OK) {
+        if (rdbSave(server.rdb_filename,NULL) != C_OK) {
             addReply(c,shared.err);
             return;
         }
         emptyDb(-1,EMPTYDB_NO_FLAGS,NULL);
-        if (rdbLoad(server.rdb_filename) != C_OK) {
+        if (rdbLoad(server.rdb_filename,NULL) != C_OK) {
             addReplyError(c,"Error trying to load the RDB dump");
             return;
         }
@@ -419,15 +415,29 @@ void debugCommand(client *c) {
             addReplyError(c,"Not an sds encoded string.");
         } else {
             addReplyStatusFormat(c,
-                "key_sds_len:%lld, key_sds_avail:%lld, "
-                "val_sds_len:%lld, val_sds_avail:%lld",
+                "key_sds_len:%lld, key_sds_avail:%lld, key_zmalloc: %lld, "
+                "val_sds_len:%lld, val_sds_avail:%lld, val_zmalloc: %lld",
                 (long long) sdslen(key),
                 (long long) sdsavail(key),
+                (long long) sdsZmallocSize(key),
                 (long long) sdslen(val->ptr),
-                (long long) sdsavail(val->ptr));
+                (long long) sdsavail(val->ptr),
+                (long long) getStringObjectSdsUsedMemory(val));
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"ziplist") && c->argc == 3) {
+        robj *o;
+
+        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
+                == NULL) return;
+
+        if (o->encoding != OBJ_ENCODING_ZIPLIST) {
+            addReplyError(c,"Not an sds encoded string.");
+        } else {
+            ziplistRepr(o->ptr);
+            addReplyStatus(c,"Ziplist structure printed on stdout");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"populate") &&
-               (c->argc == 3 || c->argc == 4)) {
+               c->argc >= 3 && c->argc <= 5) {
         long keys, j;
         robj *key, *val;
         char buf[128];
@@ -436,15 +446,25 @@ void debugCommand(client *c) {
             return;
         dictExpand(c->db->dict,keys);
         for (j = 0; j < keys; j++) {
+            long valsize = 0;
             snprintf(buf,sizeof(buf),"%s:%lu",
                 (c->argc == 3) ? "key" : (char*)c->argv[3]->ptr, j);
             key = createStringObject(buf,strlen(buf));
+            if (c->argc == 5)
+                if (getLongFromObjectOrReply(c, c->argv[4], &valsize, NULL) != C_OK)
+                    return;
             if (lookupKeyWrite(c->db,key) != NULL) {
                 decrRefCount(key);
                 continue;
             }
             snprintf(buf,sizeof(buf),"value:%lu",j);
-            val = createStringObject(buf,strlen(buf));
+            if (valsize==0)
+                val = createStringObject(buf,strlen(buf));
+            else {
+                int buflen = strlen(buf);
+                val = createStringObject(NULL,valsize);
+                memcpy(val->ptr, buf, valsize<=buflen? valsize: buflen);
+            }
             dbAdd(c->db,key,val);
             signalModifiedKey(c->db,key);
             decrRefCount(key);
@@ -518,30 +538,6 @@ void debugCommand(client *c) {
         stats = sdscat(stats,buf);
 
         addReplyBulkSds(c,stats);
-    } else if (!strcasecmp(c->argv[1]->ptr,"jemalloc") && c->argc == 3) {
-#if defined(USE_JEMALLOC)
-        if (!strcasecmp(c->argv[2]->ptr, "info")) {
-            sds info = sdsempty();
-            je_malloc_stats_print(inputCatSds, &info, NULL);
-            addReplyBulkSds(c, info);
-        } else if (!strcasecmp(c->argv[2]->ptr, "purge")) {
-            char tmp[32];
-            unsigned narenas = 0;
-            size_t sz = sizeof(unsigned);
-            if (!je_mallctl("arenas.narenas", &narenas, &sz, NULL, 0)) {
-                sprintf(tmp, "arena.%d.purge", narenas);
-                if (!je_mallctl(tmp, NULL, 0, NULL, 0)) {
-                    addReply(c, shared.ok);
-                    return;
-                }
-            }
-            addReplyError(c, "Error purging dirty pages");
-        } else {
-            addReplyErrorFormat(c, "Valid jemalloc debug fields: info, purge");
-        }
-#else
-        addReplyErrorFormat(c, "jemalloc support not available");
-#endif
     } else {
         addReplyErrorFormat(c, "Unknown DEBUG subcommand or wrong number of arguments for '%s'",
             (char*)c->argv[1]->ptr);
@@ -623,11 +619,17 @@ void _serverAssertWithInfo(const client *c, const robj *o, const char *estr, con
     _serverAssert(estr,file,line);
 }
 
-void _serverPanic(const char *msg, const char *file, int line) {
+void _serverPanic(const char *file, int line, const char *msg, ...) {
+    va_list ap;
+    va_start(ap,msg);
+    char fmtmsg[256];
+    vsnprintf(fmtmsg,sizeof(fmtmsg),msg,ap);
+    va_end(ap);
+
     bugReportStart();
     serverLog(LL_WARNING,"------------------------------------------------");
     serverLog(LL_WARNING,"!!! Software Failure. Press left mouse button to continue");
-    serverLog(LL_WARNING,"Guru Meditation: %s #%s:%d",msg,file,line);
+    serverLog(LL_WARNING,"Guru Meditation: %s #%s:%d",fmtmsg,file,line);
 #ifdef HAVE_BACKTRACE
     serverLog(LL_WARNING,"(forcing SIGSEGV in order to print the stack trace)");
 #endif
@@ -669,6 +671,8 @@ static void *getMcontextEip(ucontext_t *uc) {
     return (void*) uc->uc_mcontext.gregs[16]; /* Linux 64 */
     #elif defined(__ia64__) /* Linux IA64 */
     return (void*) uc->uc_mcontext.sc_ip;
+    #elif defined(__arm__) /* Linux ARM */
+    return (void*) uc->uc_mcontext.arm_pc;
     #endif
 #else
     return NULL;
@@ -970,6 +974,32 @@ int memtest_test_linux_anonymous_maps(void) {
 }
 #endif
 
+/* Scans the (assumed) x86 code starting at addr, for a max of `len`
+ * bytes, searching for E8 (callq) opcodes, and dumping the symbols
+ * and the call offset if they appear to be valid. */
+void dumpX86Calls(void *addr, size_t len) {
+    size_t j;
+    unsigned char *p = addr;
+    Dl_info info;
+    /* Hash table to best-effort avoid printing the same symbol
+     * multiple times. */
+    unsigned long ht[256] = {0};
+
+    if (len < 5) return;
+    for (j = 0; j < len-4; j++) {
+        if (p[j] != 0xE8) continue; /* Not an E8 CALL opcode. */
+        unsigned long target = (unsigned long)addr+j+5;
+        target += *((int32_t*)(p+j+1));
+        if (dladdr((void*)target, &info) != 0 && info.dli_sname != NULL) {
+            if (ht[target&0xff] != target) {
+                printf("Function at 0x%lx is %s\n",target,info.dli_sname);
+                ht[target&0xff] = target;
+            }
+            j += 4; /* Skip the 32 bit immediate. */
+        }
+    }
+}
+
 void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     ucontext_t *uc = (ucontext_t*) secret;
     void *eip = getMcontextEip(uc);
@@ -999,8 +1029,6 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     /* Log INFO and CLIENT LIST */
     serverLogRaw(LL_WARNING|LL_RAW, "\n------ INFO OUTPUT ------\n");
     infostring = genRedisInfoString("all");
-    infostring = sdscatprintf(infostring, "hash_init_value: %u\n",
-        dictGetHashFunctionSeed());
     serverLogRaw(LL_WARNING|LL_RAW, infostring);
     serverLogRaw(LL_WARNING|LL_RAW, "\n------ CLIENT LIST OUTPUT ------\n");
     clients = getAllClientsInfoString();
@@ -1020,12 +1048,41 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     bioKillThreads();
     if (memtest_test_linux_anonymous_maps()) {
         serverLogRaw(LL_WARNING|LL_RAW,
-            "!!! MEMORY ERROR DETECTED! Check your memory ASAP !!!");
+            "!!! MEMORY ERROR DETECTED! Check your memory ASAP !!!\n");
     } else {
         serverLogRaw(LL_WARNING|LL_RAW,
-            "Fast memory test PASSED, however your memory can still be broken. Please run a memory test for several hours if possible.");
+            "Fast memory test PASSED, however your memory can still be broken. Please run a memory test for several hours if possible.\n");
     }
 #endif
+
+    if (eip != NULL) {
+        Dl_info info;
+        if (dladdr(eip, &info) != 0) {
+            serverLog(LL_WARNING|LL_RAW,
+                "\n------ DUMPING CODE AROUND EIP ------\n"
+                "Symbol: %s (base: %p)\n"
+                "Module: %s (base %p)\n"
+                "$ xxd -r -p /tmp/dump.hex /tmp/dump.bin\n"
+                "$ objdump --adjust-vma=%p -D -b binary -m i386:x86-64 /tmp/dump.bin\n"
+                "------\n",
+                info.dli_sname, info.dli_saddr, info.dli_fname, info.dli_fbase,
+                info.dli_saddr);
+            size_t len = (long)eip - (long)info.dli_saddr;
+            unsigned long sz = sysconf(_SC_PAGESIZE);
+            if (len < 1<<13) { /* we don't have functions over 8k (verified) */
+                /* Find the address of the next page, which is our "safety"
+                 * limit when dumping. Then try to dump just 128 bytes more
+                 * than EIP if there is room, or stop sooner. */
+                unsigned long next = ((unsigned long)eip + sz) & ~(sz-1);
+                unsigned long end = (unsigned long)eip + 128;
+                if (end > next) end = next;
+                len = end - (unsigned long)info.dli_saddr;
+                serverLogHexDump(LL_WARNING, "dump of function",
+                    info.dli_saddr ,len);
+                dumpX86Calls(info.dli_saddr,len);
+            }
+        }
+    }
 
     serverLogRaw(LL_WARNING|LL_RAW,
 "\n=== REDIS BUG REPORT END. Make sure to include from START to END. ===\n\n"
@@ -1033,6 +1090,7 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
 "           http://github.com/antirez/redis/issues\n\n"
 "  Suspect RAM error? Use redis-server --test-memory to verify it.\n\n"
 );
+
     /* free(messages); Don't call free() with possibly corrupted memory. */
     if (server.daemonize && server.supervised == 0) unlink(server.pidfile);
 
@@ -1053,7 +1111,7 @@ void serverLogHexDump(int level, char *descr, void *value, size_t len) {
     unsigned char *v = value;
     char charset[] = "0123456789abcdef";
 
-    serverLog(level,"%s (hexdump):", descr);
+    serverLog(level,"%s (hexdump of %zu bytes):", descr, len);
     b = buf;
     while(len) {
         b[0] = charset[(*v)>>4];

@@ -41,6 +41,8 @@ set ::all_tests {
     integration/rdb
     integration/convert-zipmap-hash-on-load
     integration/logging
+    integration/psync2
+    integration/psync2-reg
     unit/pubsub
     unit/slowlog
     unit/scripting
@@ -55,6 +57,7 @@ set ::all_tests {
     unit/memefficiency
     unit/hyperloglog
     unit/lazyfree
+    unit/wait
 }
 # Index to the next test to run in the ::all_tests list.
 set ::next_test 0

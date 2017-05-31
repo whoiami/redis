@@ -275,6 +275,10 @@ static void cliIntegrateHelp(void) {
      * don't already match what we have. */
     for (size_t j = 0; j < reply->elements; j++) {
         redisReply *entry = reply->element[j];
+        if (entry->type != REDIS_REPLY_ARRAY || entry->elements < 4 ||
+            entry->element[0]->type != REDIS_REPLY_STRING ||
+            entry->element[1]->type != REDIS_REPLY_INTEGER ||
+            entry->element[3]->type != REDIS_REPLY_INTEGER) return;
         char *cmdname = entry->element[0]->str;
         int i;
 
@@ -336,7 +340,7 @@ static void cliOutputGenericHelp(void) {
         "      \"help <tab>\" to get a list of possible help topics\n"
         "      \"quit\" to exit\n"
         "\n"
-        "To set redis-cli perferences:\n"
+        "To set redis-cli preferences:\n"
         "      \":set hints\" enable online hints\n"
         "      \":set nohints\" disable online hints\n"
         "Set your preferences in ~/.redisclirc\n",
@@ -843,8 +847,10 @@ static int cliSendCommand(int argc, char **argv, int repeat) {
     output_raw = 0;
     if (!strcasecmp(command,"info") ||
         (argc >= 2 && !strcasecmp(command,"debug") &&
-                      ((!strcasecmp(argv[1],"jemalloc") && !strcasecmp(argv[2],"info")) ||
-                       !strcasecmp(argv[1],"htstats"))) ||
+                       !strcasecmp(argv[1],"htstats")) ||
+        (argc >= 2 && !strcasecmp(command,"memory") &&
+                      (!strcasecmp(argv[1],"malloc-stats") ||
+                       !strcasecmp(argv[1],"doctor"))) ||
         (argc == 2 && !strcasecmp(command,"cluster") &&
                       (!strcasecmp(argv[1],"nodes") ||
                        !strcasecmp(argv[1],"info"))) ||
@@ -1220,7 +1226,7 @@ static sds *cliSplitArgs(char *line, int *argc) {
     }
 }
 
-/* Set the CLI perferences. This function is invoked when an interactive
+/* Set the CLI preferences. This function is invoked when an interactive
  * ":command" is called, or when reading ~/.redisclirc file, in order to
  * set user preferences. */
 void cliSetPreferences(char **argv, int argc, int interactive) {
@@ -1255,6 +1261,7 @@ void cliLoadPreferences(void) {
             if (argc > 0) cliSetPreferences(argv,argc,0);
             sdsfreesplitres(argv,argc);
         }
+        fclose(fp);
     }
     sdsfree(rcfile);
 }
@@ -1265,6 +1272,11 @@ static void repl(void) {
     char *line;
     int argc;
     sds *argv;
+
+    /* Initialize the help and, if possible, use the COMMAND command in order
+     * to retrieve missing entries. */
+    cliInitHelp();
+    cliIntegrateHelp();
 
     config.interactive = 1;
     linenoiseSetMultiLine(1);
@@ -2012,8 +2024,13 @@ static void getKeyTypes(redisReply *keys, int *types) {
                 keys->element[i]->str, context->err, context->errstr);
             exit(1);
         } else if(reply->type != REDIS_REPLY_STATUS) {
-            fprintf(stderr, "Invalid reply type (%d) for TYPE on key '%s'!\n",
-                reply->type, keys->element[i]->str);
+            if(reply->type == REDIS_REPLY_ERROR) {
+                fprintf(stderr, "TYPE returned an error: %s\n", reply->str);
+            } else {
+                fprintf(stderr,
+                    "Invalid reply type (%d) for TYPE on key '%s'!\n",
+                    reply->type, keys->element[i]->str);
+            }
             exit(1);
         }
 
@@ -2598,11 +2615,6 @@ int main(int argc, char **argv) {
     firstarg = parseOptions(argc,argv);
     argc -= firstarg;
     argv += firstarg;
-
-    /* Initialize the help and, if possible, use the COMMAND command in order
-     * to retrieve missing entries. */
-    cliInitHelp();
-    cliIntegrateHelp();
 
     /* Latency mode */
     if (config.latency_mode) {
